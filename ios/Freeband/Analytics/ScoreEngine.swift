@@ -1,0 +1,207 @@
+import Foundation
+
+/// What one scored day leaves behind for the baselines of the days after it.
+struct HistoryPoint: Codable, Equatable, Sendable {
+    var day: DayKey
+    var restingHR: Double?
+    var hrv: Double?
+    var sleepScore: Double?
+    var strain: Double?
+    var midSleepMinute: Double?
+    /// Sleep contributor values by name, for the 14-day medians shown next to them.
+    var sleepValues: [String: Double] = [:]
+    /// Which HRV metric `hrv` represents (RMSSD vs SDNN); kept isolated in baselines.
+    var hrvKind: HrvMetricKind? = nil
+    /// Identifier of the watch/source that produced this day (detects watch switches).
+    var dataSourceId: String? = nil
+}
+
+struct NapSummary: Codable, Equatable, Sendable {
+    var bedTime: Date
+    var wakeTime: Date
+    var minutes: Double
+}
+
+/// Everything known about one day, in plain values.
+struct DayInputs: Sendable {
+    var day: DayKey
+    /// The day's minute file, if any.
+    var minutes: MinuteSeries?
+    /// The day before (a night starts there; the HR-dip reference is the evening before bed).
+    var previousMinutes: MinuteSeries?
+    /// Primary sleep sessions that end on this day (main sleep and naps).
+    var sleeps: [SleepInput]
+    /// Primary sessions that end on the day before.
+    var previousSleeps: [SleepInput]
+    /// The band's own resting HR from the daily summary.
+    var bandRestingHR: Int?
+    /// For today: minutes after this are not lived yet.
+    var now: Date?
+    /// External HRV in ms (Apple HealthKit SDNN or 60 s BLE chest strap RMSSD), used when no raw RR file exists.
+    var externalHrvMs: Double?
+    /// Kind of `externalHrvMs` (SDNN for Apple HealthKit, RMSSD for BLE strap / Garmin / Polar).
+    var hrvMetricKind: HrvMetricKind
+    /// Identifier of the watch/source for this day (for source-change detection).
+    var dataSourceId: String?
+
+    init(day: DayKey, minutes: MinuteSeries? = nil, previousMinutes: MinuteSeries? = nil, sleeps: [SleepInput] = [],
+         previousSleeps: [SleepInput] = [], bandRestingHR: Int? = nil, now: Date? = nil,
+         externalHrvMs: Double? = nil, hrvMetricKind: HrvMetricKind = .rmssd, dataSourceId: String? = nil) {
+        self.day = day
+        self.minutes = minutes
+        self.previousMinutes = previousMinutes
+        self.sleeps = sleeps
+        self.previousSleeps = previousSleeps
+        self.bandRestingHR = bandRestingHR
+        self.now = now
+        self.externalHrvMs = externalHrvMs
+        self.hrvMetricKind = hrvMetricKind
+        self.dataSourceId = dataSourceId
+    }
+}
+
+struct DayScoreResult: Codable, Equatable, Sendable {
+    var day: DayKey
+    var algoVersion: Int
+    var sleep: SleepScoreResult
+    var recovery: RecoveryResult
+    var strain: StrainResult?
+    var strainConfidence: Confidence
+    var restingHR: RestingHR?
+    var hrv: HRVResult?
+    /// Usable HRV windows found in the second half of the night.
+    var hrvWindows: Int
+    var hasRR: Bool
+    var stress: StressSummary?
+    var spo2: SpO2Summary?
+    var naps: [NapSummary]
+    var dataSourceId: String? = nil
+
+    var history: HistoryPoint {
+        var values: [String: Double] = [:]
+        for c in sleep.contributors {
+            if let v = c.value { values[c.name.rawValue] = v }
+        }
+        return HistoryPoint(day: day, restingHR: restingHR?.value, hrv: hrv?.rmssd, sleepScore: sleep.score.map(Double.init),
+                            strain: strain?.strain, midSleepMinute: sleep.metrics?.midSleepMinute, sleepValues: values,
+                            hrvKind: hrv?.kind, dataSourceId: dataSourceId)
+    }
+}
+
+/// Scores days from plain inputs: sleep, recovery, strain, plus the shown-only stress and SpO2.
+/// Pure and deterministic; the store side is DailyRollup.
+enum ScoreEngine {
+    /// Bump when any formula or constant in Analytics/ changes; stored scores with an older
+    /// version are recomputed at launch.
+    /// 2: the sleep score is capped at its duration sub-score + 10 (SleepScore.durationLead).
+    /// 3: no recovery score for a day without a night.
+    /// 4: multi-watch external HRV (RMSSD vs SDNN baseline isolation) and source-change detection.
+    static let algoVersion = 4
+
+    static func score(_ input: DayInputs, history: [HistoryPoint], profile: Profile) -> DayScoreResult {
+        let day = input.day
+        let past = history
+            .filter { $0.day < day && $0.day.index >= day.index - Baseline.lookbackDays }
+            .sorted { $0.day > $1.day }
+
+        // Main sleep: the longest non-nap session ending today; the rest are naps. (v1 does not
+        // join a night the band split in two; the shorter part is listed with the naps.)
+        let mainIndex = input.sleeps.indices.filter { !input.sleeps[$0].isNap }
+            .max { input.sleeps[$0].inBedMinutes < input.sleeps[$1].inBedMinutes }
+        let main = mainIndex.map { input.sleeps[$0] }
+        let naps = input.sleeps.indices.filter { $0 != mainIndex }.map { input.sleeps[$0] }
+        let minuteDays = [input.previousMinutes, input.minutes].compactMap { $0 }
+        let allSleeps = input.sleeps + input.previousSleeps
+
+        var metrics: SleepMetrics?
+        if let main {
+            let awakeMean = SleepMetricsCalc.awakeHRMean(before: main.bedTime, minutes: minuteDays, sleeps: allSleeps)
+            metrics = SleepMetricsCalc.compute(main, minutes: minuteDays, awakeHRMean: awakeMean)
+        }
+
+        let previousMids = past.filter { $0.day.index >= day.index - SleepScore.regularityNights }.compactMap(\.midSleepMinute)
+        var sleepBaselines: [SleepContributor.Name: Double] = [:]
+        for name in SleepContributor.Name.allCases {
+            let values = past.compactMap { $0.sleepValues[name.rawValue] }.prefix(Baseline.window)
+            if let m = Stats.median(Array(values)) { sleepBaselines[name] = m }
+        }
+        let sleep = SleepScore.score(metrics, sleepNeedMinutes: profile.sleepNeed, previousMidSleeps: previousMids,
+                                     baselines: sleepBaselines)
+
+        let restingHR = RestingHR.compute(sleepLowest5Min: metrics?.hrLowest5Min, bandValue: input.bandRestingHR,
+                                          minutes: input.minutes, sleeps: allSleeps)
+
+        let hasRR = main?.rr.contains { !$0.intervalsMs.isEmpty } ?? false
+        var hrv: HRVResult?
+        var windows = 0
+        var hrvExternal = false
+        if hasRR, let main {
+            (hrv, windows) = HRV.nightly(main.rr, bedTime: main.bedTime, wakeTime: main.wakeTime)
+        }
+        if hrv == nil, let ext = input.externalHrvMs, ext >= 5.0, ext <= 250.0 {
+            hrv = HRVResult(rmssd: ext, secondHalfWindows: 1, totalBeats: 0, approximate: false, kind: input.hrvMetricKind)
+            hrvExternal = true
+        }
+
+        // Strict RMSSD vs SDNN isolation: never mix different HRV definitions in one 14-day baseline.
+        let todayHrvKind = hrv?.kind ?? input.hrvMetricKind
+        let hrvHistory = past
+            .filter { ($0.hrvKind ?? .rmssd) == todayHrvKind }
+            .compactMap(\.hrv)
+
+        // Detect watch/source switch compared to the most recent prior day that reported a source.
+        let prevSource = past.first { $0.dataSourceId != nil }?.dataSourceId
+        let sourceChanged = input.dataSourceId != nil && prevSource != nil && prevSource != input.dataSourceId
+
+        let yesterday = day.adding(days: -1)
+        var recovery = Recovery.score(Recovery.Inputs(
+            hrv: hrv?.rmssd, hrvHistory: hrvHistory, hasRR: hasRR, hrvWindows: windows,
+            restingHR: restingHR, restingHRHistory: past.compactMap(\.restingHR),
+            sleepScore: sleep.score.map(Double.init), sleepHistory: past.compactMap(\.sleepScore),
+            strainYesterday: past.first { $0.day == yesterday }?.strain,
+            strainHistory: past.filter { $0.day < yesterday }.compactMap(\.strain),
+            hrvExternal: hrvExternal,
+            sourceChanged: sourceChanged
+        ))
+        // v3: recovery is read from the night. Without one the only resting heart rate is the band's
+        // running daytime value, and early in a day that is nowhere near a resting one (measured
+        // 2026-11-16: 75 bpm at 02:00 against a normal of 64 scored a recovery of 0).
+        if main == nil {
+            recovery.score = nil
+            recovery.confidence = Confidence(.none, reasons: [ConfidenceReason(.noSleep)])
+        }
+
+        let strainRest = restingHR?.value ?? Baseline.compute(past.compactMap(\.restingHR), floor: .restingHR)?.median
+        let strain = input.minutes.flatMap {
+            Strain.compute($0, sleeps: allSleeps, restingHR: strainRest, profile: profile, now: input.now)
+        }
+
+        var spo2: SpO2Summary?
+        if let m = metrics, let avg = m.spo2Average, let low = m.spo2Minimum {
+            spo2 = SpO2Summary(average: avg, minimum: low, below90Minutes: m.spo2Below90Minutes ?? 0)
+        }
+
+        return DayScoreResult(
+            day: day, algoVersion: algoVersion, sleep: sleep, recovery: recovery, strain: strain,
+            strainConfidence: strain?.confidence ?? Confidence(.none, reasons: [ConfidenceReason(.noData)]),
+            restingHR: restingHR, hrv: hrv, hrvWindows: windows, hasRR: hasRR,
+            stress: input.minutes.flatMap(StressSummary.compute), spo2: spo2,
+            naps: naps.map { NapSummary(bedTime: $0.bedTime, wakeTime: $0.wakeTime, minutes: $0.inBedMinutes) },
+            dataSourceId: input.dataSourceId
+        )
+    }
+
+    /// Scores days in order; each day's result feeds the baselines of the days after it.
+    /// `history`: points for days before the range (from stored scores).
+    static func scoreRange(_ days: [DayInputs], history: [HistoryPoint], profile: Profile) -> [DayScoreResult] {
+        var points: [DayKey: HistoryPoint] = [:]
+        for p in history { points[p.day] = p }
+        var out: [DayScoreResult] = []
+        for input in days.sorted(by: { $0.day < $1.day }) {
+            let result = score(input, history: Array(points.values), profile: profile)
+            points[input.day] = result.history
+            out.append(result)
+        }
+        return out
+    }
+}

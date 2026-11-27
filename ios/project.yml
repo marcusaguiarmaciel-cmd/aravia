@@ -1,0 +1,103 @@
+name: Freeband
+options:
+  bundleIdPrefix: dev.cobanov
+  developmentLanguage: en
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  MapLibre:
+    url: https://github.com/maplibre/maplibre-gl-native-distribution
+    exactVersion: 6.31.0
+  GoogleMobileAds:
+    url: https://github.com/googleads/swift-package-manager-google-mobile-ads
+    exactVersion: 12.4.0
+settings:
+  base:
+    DEVELOPMENT_TEAM: 6U58AKY6F8
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    SWIFT_EMIT_LOC_STRINGS: YES
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  Freeband:
+    type: application
+    platform: iOS
+    dependencies:
+      - package: MapLibre
+      - package: GoogleMobileAds
+      - target: AraviaWidgets
+    sources:
+      - path: Freeband
+        excludes:
+          - "**/*.old"
+      - path: Shared
+    info:
+      path: Freeband/Info.plist
+      properties:
+        CFBundleDisplayName: Aravia
+        UIAppFonts: [Barlow-Regular.ttf, Barlow-Medium.ttf, Barlow-SemiBold.ttf, Barlow-Bold.ttf]
+        CFBundleDevelopmentRegion: pt-BR
+        CFBundleLocalizations: [pt-BR, en, tr]
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSPhotoLibraryAddUsageDescription: Aravia salva no seu rolo da câmera os vídeos e overlays de rota que você pedir.
+        NSPhotoLibraryUsageDescription: Aravia lê a foto da galeria que você escolher para montar o overlay de Story.
+        NSHealthShareUsageDescription: Aravia lê seus passos, batimentos cardíacos, HRV, sono, SpO₂ e rotas de treino do Apple Saúde para mostrar suas pontuações e fazer sua arara crescer — tudo fica só no seu iPhone.
+        NSBluetoothAlwaysUsageDescription: Aravia usa Bluetooth para conversar com seu relógio ou cinta cardíaca (padrão 0x180D e conexão direta Xiaomi/Redmi).
+        NSLocationWhenInUseUsageDescription: If you turn on Share location with the band, Freeband sends this phone's location to your band when the band asks for it. It goes nowhere else.
+        ITSAppUsesNonExemptEncryption: false
+        # Strava app credentials from the build's environment (tools/build-ipa.sh); empty without them.
+        StravaClientID: $(STRAVA_CLIENT_ID)
+        StravaClientSecret: $(STRAVA_CLIENT_SECRET)
+        # Opt-in Rewarded AdMob IDs (defaults to official Google iOS test IDs in tools/build-ipa.sh).
+        GADApplicationIdentifier: $(ADMOB_IOS_APP_ID)
+        AdMobRewardedUnitID: $(ADMOB_IOS_REWARDED_UNIT_ID)
+        # LGPD controller document injected from CI secret LEGAL_CONTROLLER_DOC (never committed).
+        AraviaControllerDoc: $(LEGAL_CONTROLLER_DOC)
+        SKAdNetworkItems:
+          - SKAdNetworkIdentifier: cstr6suwn9.skadnetwork
+        NSSupportsLiveActivities: true
+        CFBundleURLTypes:
+          - CFBundleURLName: app.aravia.watch
+            CFBundleURLSchemes: [aravia]
+        LSApplicationCategoryType: public.app-category.healthcare-fitness
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIRequiredDeviceCapabilities: [bluetooth-le]
+        # Stay connected (docs/STAY-CONNECTED.md): Bluetooth events in the background, and ringing for Find Phone.
+        # fetch: background refresh runs a sync (AppModel.registerBackgroundRefresh).
+        UIBackgroundModes: [bluetooth-central, audio, fetch]
+        BGTaskSchedulerPermittedIdentifiers: [dev.cobanov.freeband.sync]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.aravia.watch
+        PRODUCT_NAME: Freeband
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        OTHER_LDFLAGS: ["$(inherited)", "-ObjC"]
+  AraviaWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: AraviaWidgets
+      - path: Shared
+    info:
+      path: AraviaWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Aravia
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.aravia.watch.widgets
+        PRODUCT_NAME: AraviaWidgets
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: YES

@@ -1,0 +1,987 @@
+import CommonCrypto
+import CryptoKit
+import Foundation
+
+// Xiaomi wearable protocol over BLE V2 (service FE95, RX 005E, TX 005F).
+// Byte layouts and their Gadgetbridge citations are in findings.md, sections 4 and 5.
+// Platform independent (Foundation, CryptoKit, CommonCrypto) so it can be tested on the Mac.
+
+enum MiFrame {
+    static let kindNack: UInt8 = 0
+    static let kindAck: UInt8 = 1
+    static let kindSessionConfig: UInt8 = 2
+    static let kindData: UInt8 = 3
+
+    struct Packet {
+        let kind: UInt8
+        let seq: UInt8
+        let payload: Data
+        let frx: Bool
+
+        init(kind: UInt8, seq: UInt8, payload: Data, frx: Bool = false) {
+            self.kind = kind
+            self.seq = seq
+            self.payload = payload
+            self.frx = frx
+        }
+    }
+
+    /// Maximum payload length declared in startSessionPayload (0xFC00 = 64512 bytes).
+    static let maxPayloadLength = 0xFC00
+
+    /// START_SESSION_REQUEST: opcode 1, then TLVs version 01.00.00, max frame 0xFC00,
+    /// TX window 32, send timeout 10000 ms.
+    static let startSessionPayload = Data([
+        0x01,
+        0x01, 0x03, 0x00, 0x01, 0x00, 0x00,
+        0x02, 0x02, 0x00, 0x00, 0xFC,
+        0x03, 0x02, 0x00, 0x20, 0x00,
+        0x04, 0x02, 0x00, 0x10, 0x27,
+    ])
+
+    /// The TX window in startSessionPayload: data frames the device may have unacknowledged.
+    static let txWindow: UInt8 = 32
+
+    /// The seqs to resend for a NACK carrying `nack` (the seq the device expects next) when `next`
+    /// is the seq about to be sent: `nack` up to `next`, across the wrap; none outside the window.
+    static func resendSeqs(next: UInt8, nack: UInt8) -> [UInt8] {
+        let pending = next &- nack
+        guard pending > 0, pending <= txWindow else { return [] }
+        return (0..<pending).map { nack &+ $0 }
+    }
+
+    /// Layer-1 RX sequence tracker for BLE V2 Data frames (findings.md §4.5; AstroBox sar/mod.rs:706-740).
+    /// Drops retransmitted duplicates and requests missing frames via NACK before upper layers
+    /// (such as ActivityAssembler) see corrupted/out-of-order chunks.
+    struct RxWindow {
+        enum Decision: Equatable {
+            case deliverFast
+            case deliver(ack: UInt8)
+            case gap(nack: UInt8)
+            /// The gap was never refilled: accept this frame and continue from it.
+            case resync(ack: UInt8)
+            case duplicate(ack: UInt8)
+            case drop
+        }
+
+        /// Frames ahead of the expected seq tolerated (each answered with a NACK) before the
+        /// window gives up on the missing frame and continues from the newest one. Without this,
+        /// a band that does not resend after a NACK stalls the link for good: nothing after the
+        /// lost frame reaches the upper layers, so the file in flight never completes.
+        static let maxGapFrames = 8
+
+        private(set) var expectSeq: UInt8 = 0
+        private(set) var inOrderSeen = false
+        private(set) var gapFrames = 0
+
+        mutating func reset() {
+            expectSeq = 0
+            inOrderSeen = false
+            gapFrames = 0
+        }
+
+        mutating func receive(seq: UInt8, frx: Bool) -> Decision {
+            if frx { return .deliverFast }
+            if seq == expectSeq {
+                expectSeq &+= 1
+                inOrderSeen = true
+                gapFrames = 0
+                return .deliver(ack: seq)
+            }
+            let ahead = (seq &- expectSeq) < 128
+            if ahead || !inOrderSeen {
+                gapFrames += 1
+                if gapFrames > Self.maxGapFrames {
+                    expectSeq = seq &+ 1
+                    inOrderSeen = true
+                    gapFrames = 0
+                    return .resync(ack: seq)
+                }
+                return ahead ? .gap(nack: expectSeq) : .drop
+            }
+            return .duplicate(ack: expectSeq &- 1)
+        }
+    }
+
+    /// CRC-16/ARC over the payload only.
+    static func crc16arc(_ data: Data) -> UInt16 {
+        var crc: UInt16 = 0
+        for byte in data {
+            crc ^= UInt16(byte)
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xA001 : crc >> 1
+            }
+        }
+        return crc
+    }
+
+    /// a5 a5 | type | seq | len (u16 LE) | crc16 (u16 LE) | payload
+    static func encode(kind: UInt8, seq: UInt8, payload: Data) -> Data {
+        let len = UInt16(payload.count)
+        let crc = crc16arc(payload)
+        var out = Data([0xA5, 0xA5, kind & 0x0F, seq])
+        out.append(contentsOf: [UInt8(len & 0xFF), UInt8(len >> 8), UInt8(crc & 0xFF), UInt8(crc >> 8)])
+        out.append(payload)
+        return out
+    }
+
+    /// Removes every complete frame from the front of `buffer`. Bytes before a preamble and
+    /// frames with an impossible length or bad checksum resync at the next 0xA5 0xA5; an
+    /// incomplete frame stays for the next call.
+    static func drain(_ buffer: inout [UInt8]) -> [Packet] {
+        var packets: [Packet] = []
+        while buffer.count >= 2 {
+            guard buffer[0] == 0xA5, buffer[1] == 0xA5 else {
+                if let next = buffer.dropFirst().firstIndex(of: 0xA5) {
+                    buffer.removeFirst(next)
+                } else {
+                    buffer.removeAll()
+                }
+                continue
+            }
+            guard buffer.count >= 3 else { break }
+            // Types are 0-3; anything else means this a5 a5 was not a real preamble.
+            guard buffer[2] & 0x0F <= kindData else {
+                buffer.removeFirst()
+                continue
+            }
+            guard buffer.count >= 8 else { break }
+            let len = Int(buffer[4]) | Int(buffer[5]) << 8
+            guard len <= maxPayloadLength else {
+                buffer.removeFirst()
+                continue
+            }
+            guard buffer.count >= 8 + len else { break }
+            let crc = UInt16(buffer[6]) | UInt16(buffer[7]) << 8
+            let payload = Data(buffer[8..<(8 + len)])
+            guard crc16arc(payload) == crc else {
+                buffer.removeFirst()
+                continue
+            }
+            let kind = buffer[2] & 0x0F
+            let frx = (buffer[2] & 0x10) != 0
+            let seq = buffer[3]
+            buffer.removeFirst(8 + len)
+            packets.append(Packet(kind: kind, seq: seq, payload: payload, frx: frx))
+        }
+        return packets
+    }
+}
+
+/// Minimal proto2 writer: only what the commands below need.
+struct PBWriter {
+    private(set) var data = Data()
+
+    mutating func varint(_ field: Int, _ value: UInt64) {
+        key(field, wire: 0)
+        putVarint(value)
+    }
+
+    mutating func bytes(_ field: Int, _ value: Data) {
+        key(field, wire: 2)
+        putVarint(UInt64(value.count))
+        data.append(value)
+    }
+
+    /// sint32/sint64: zigzag-encoded varint.
+    mutating func sint(_ field: Int, _ value: Int64) {
+        varint(field, UInt64(bitPattern: (value << 1) ^ (value >> 63)))
+    }
+
+    /// double: wire type 1, 8 bytes little-endian.
+    mutating func double(_ field: Int, _ value: Double) {
+        key(field, wire: 1)
+        withUnsafeBytes(of: value.bitPattern.littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    mutating func bool(_ field: Int, _ value: Bool) {
+        varint(field, value ? 1 : 0)
+    }
+
+    mutating func string(_ field: Int, _ value: String) {
+        bytes(field, Data(value.utf8))
+    }
+
+    mutating func message(_ field: Int, _ value: PBWriter) {
+        bytes(field, value.data)
+    }
+
+    private mutating func key(_ field: Int, wire: UInt64) {
+        putVarint(UInt64(field) << 3 | wire)
+    }
+
+    private mutating func putVarint(_ value: UInt64) {
+        var v = value
+        while v >= 0x80 {
+            data.append(UInt8(v & 0x7F) | 0x80)
+            v >>= 7
+        }
+        data.append(UInt8(v))
+    }
+}
+
+/// Minimal proto2 reader: keeps the last varint and the last length-delimited value per field.
+struct PBMessage {
+    private(set) var varints: [Int: UInt64] = [:]
+    private(set) var blobs: [Int: Data] = [:]
+    private(set) var fieldNumbers: [Int] = []
+
+    init?(_ data: Data) {
+        let b = [UInt8](data)
+        var i = 0
+        func readVarint() -> UInt64? {
+            var result: UInt64 = 0
+            var shift: UInt64 = 0
+            while i < b.count, shift < 64 {
+                let x = b[i]
+                i += 1
+                result |= UInt64(x & 0x7F) << shift
+                if x & 0x80 == 0 { return result }
+                shift += 7
+            }
+            return nil
+        }
+        while i < b.count {
+            guard let key = readVarint() else { return nil }
+            let field = Int(key >> 3)
+            switch key & 7 {
+            case 0:
+                guard let v = readVarint() else { return nil }
+                varints[field] = v
+            case 1:
+                guard b.count - i >= 8 else { return nil }
+                i += 8
+            case 2:
+                guard let n = readVarint(), n <= UInt64(b.count - i) else { return nil }
+                blobs[field] = Data(b[i..<(i + Int(n))])
+                i += Int(n)
+            case 5:
+                guard b.count - i >= 4 else { return nil }
+                i += 4
+            default:
+                return nil
+            }
+            fieldNumbers.append(field)
+        }
+    }
+
+    func message(_ field: Int) -> PBMessage? {
+        blobs[field].flatMap(PBMessage.init)
+    }
+}
+
+enum MiCrypto {
+    static func hmacSHA256(key: Data, _ message: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: key)))
+    }
+
+    /// HKDF-SHA256 with salt = phoneNonce ‖ watchNonce, IKM = auth key, info = "miwear-auth", 64 bytes.
+    static func sessionKeyMaterial(authKey: Data, phoneNonce: Data, watchNonce: Data) -> Data {
+        let okm = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: authKey),
+                                         salt: phoneNonce + watchNonce,
+                                         info: Data("miwear-auth".utf8),
+                                         outputByteCount: 64)
+        return okm.withUnsafeBytes { Data($0) }
+    }
+
+    static func aesBlock(key: Data, _ block: Data) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: 16)
+        var moved = 0
+        let status = key.withUnsafeBytes { k in
+            block.withUnsafeBytes { b in
+                CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionECBMode),
+                        k.baseAddress, key.count, nil, b.baseAddress, 16, &out, 16, &moved)
+            }
+        }
+        precondition(status == kCCSuccess, "AES block failed: \(status)")
+        return out
+    }
+
+    /// AES-128-CCM (RFC 3610) with a 12-byte nonce and a 4-byte tag. Associated data is empty
+    /// everywhere but in the bind result (docs/BIND.md section 3).
+    /// Returns ciphertext ‖ tag. Apple frameworks have no CCM, so it is built on AES-ECB.
+    static func ccmEncrypt(key: Data, nonce: Data, plaintext: Data, aad: Data = Data()) -> Data {
+        precondition(nonce.count == 12)
+        let p = [UInt8](plaintext)
+        let tag = ccmTag(key: key, nonce: nonce, aad: [UInt8](aad), plaintext: p)
+        return ccmKeystream(key: key, nonce: nonce, p) + Data(tag)
+    }
+
+    /// The reverse of ccmEncrypt: nil when the input is shorter than the tag or the tag doesn't match.
+    static func ccmDecrypt(key: Data, nonce: Data, ciphertextAndTag: Data, aad: Data = Data()) -> Data? {
+        precondition(nonce.count == 12)
+        let c = [UInt8](ciphertextAndTag)
+        guard c.count >= ccmTagLength else { return nil }
+        let bodyLength = c.count - ccmTagLength
+        let plaintext = ccmKeystream(key: key, nonce: nonce, Array(c[..<bodyLength]))
+        let tag = ccmTag(key: key, nonce: nonce, aad: [UInt8](aad), plaintext: [UInt8](plaintext))
+        var difference: UInt8 = 0
+        for j in 0..<ccmTagLength { difference |= tag[j] ^ c[bodyLength + j] }
+        return difference == 0 ? plaintext : nil
+    }
+
+    private static let ccmTagLength = 4
+    /// Bytes of the length field: 15 minus the 12-byte nonce.
+    private static let ccmLengthSize = 3
+
+    private static func ccmCounterBlock(_ nonce: Data, _ counter: Int) -> Data {
+        Data([UInt8(ccmLengthSize - 1)]) + nonce
+            + Data([UInt8((counter >> 16) & 0xFF), UInt8((counter >> 8) & 0xFF), UInt8(counter & 0xFF)])
+    }
+
+    /// CBC-MAC over B0, the associated data (behind its 2-byte length) and the plaintext, each
+    /// zero-padded to whole blocks, masked with counter block 0.
+    private static func ccmTag(key: Data, nonce: Data, aad: [UInt8], plaintext p: [UInt8]) -> [UInt8] {
+        precondition(aad.count < 0xFF00)
+        var b0 = Data([UInt8((aad.isEmpty ? 0 : 0x40) | ((ccmTagLength - 2) / 2) << 3 | (ccmLengthSize - 1))]) + nonce
+        b0.append(contentsOf: [UInt8((p.count >> 16) & 0xFF), UInt8((p.count >> 8) & 0xFF), UInt8(p.count & 0xFF)])
+        var mac = aesBlock(key: key, b0)
+        let a = aad.isEmpty ? [] : [UInt8(aad.count >> 8), UInt8(aad.count & 0xFF)] + aad
+        for part in [a, p] {
+            for start in stride(from: 0, to: part.count, by: 16) {
+                var block = mac
+                for j in 0..<min(16, part.count - start) { block[j] ^= part[start + j] }
+                mac = aesBlock(key: key, Data(block))
+            }
+        }
+        let s0 = aesBlock(key: key, ccmCounterBlock(nonce, 0))
+        return (0..<ccmTagLength).map { mac[$0] ^ s0[$0] }
+    }
+
+    /// Counter blocks 1, 2, … XORed over the input: encrypts and decrypts alike.
+    private static func ccmKeystream(key: Data, nonce: Data, _ input: [UInt8]) -> Data {
+        var out = Data()
+        for (n, start) in stride(from: 0, to: input.count, by: 16).enumerated() {
+            let s = aesBlock(key: key, ccmCounterBlock(nonce, n + 1))
+            for j in 0..<min(16, input.count - start) { out.append(input[start + j] ^ s[j]) }
+        }
+        return out
+    }
+
+    /// AES-128-CTR with the key reused as the initial counter block (the V2 channel cipher;
+    /// the counter restarts for every message).
+    static func ctr(key: Data, _ input: Data) -> Data {
+        var cryptor: CCCryptorRef?
+        let created = key.withUnsafeBytes { k in
+            CCCryptorCreateWithMode(CCOperation(kCCEncrypt), CCMode(kCCModeCTR), CCAlgorithm(kCCAlgorithmAES),
+                                    CCPadding(ccNoPadding), k.baseAddress, k.baseAddress, key.count,
+                                    nil, 0, 0, CCModeOptions(kCCModeOptionCTR_BE), &cryptor)
+        }
+        precondition(created == kCCSuccess, "CTR init failed: \(created)")
+        defer { CCCryptorRelease(cryptor) }
+        var out = [UInt8](repeating: 0, count: input.count)
+        var moved = 0
+        let status = input.withUnsafeBytes { i in
+            CCCryptorUpdate(cryptor, i.baseAddress, input.count, &out, out.count, &moved)
+        }
+        precondition(status == kCCSuccess, "CTR update failed: \(status)")
+        return Data(out)
+    }
+}
+
+enum MiAuth {
+    static let commandTypeAuth: UInt64 = 1
+    static let subtypeNonce: UInt64 = 26
+    static let subtypeAuth: UInt64 = 27
+
+    struct SessionKeys {
+        let decryptionKey: Data
+        let encryptionKey: Data
+        let decryptionNonce: Data
+        let encryptionNonce: Data
+    }
+
+    /// Step 1: Command{type 1, subtype 26, auth.appVerify{nonce}}. `appDeviceID` is the id a
+    /// local bind gave the band (docs/BIND.md section 6); nil for a key from the vendor app.
+    static func nonceCommand(phoneNonce: Data, appDeviceID: String? = nil) -> Data {
+        var verify = PBWriter()
+        verify.bytes(1, phoneNonce)
+        if let appDeviceID { verify.string(2, appDeviceID) }
+        var account = PBWriter()
+        account.message(30, verify)
+        var command = PBWriter()
+        command.varint(1, commandTypeAuth)
+        command.varint(2, subtypeNonce)
+        command.message(3, account)
+        return command.data
+    }
+
+    /// Step 3: derives the session keys, checks the watch's HMAC (nil means the auth key is
+    /// wrong) and builds Command{type 1, subtype 27, auth.appConfirm{...}}.
+    static func confirmCommand(authKey: Data, phoneNonce: Data, watchNonce: Data, watchHmac: Data,
+                               deviceName: String) -> (command: Data, keys: SessionKeys)? {
+        let okm = [UInt8](MiCrypto.sessionKeyMaterial(authKey: authKey, phoneNonce: phoneNonce, watchNonce: watchNonce))
+        let keys = SessionKeys(decryptionKey: Data(okm[0..<16]),
+                               encryptionKey: Data(okm[16..<32]),
+                               decryptionNonce: Data(okm[32..<36]),
+                               encryptionNonce: Data(okm[36..<40]))
+
+        guard MiCrypto.hmacSHA256(key: keys.decryptionKey, watchNonce + phoneNonce) == watchHmac else {
+            return nil
+        }
+
+        // CompanionDevice as AstroBox sends it over BLE on iOS: device_type IOS (1, always
+        // serialized), device_name, app_capability 0xFFFFFFFF.
+        var companion = PBWriter()
+        companion.varint(1, 1)
+        companion.string(3, deviceName)
+        companion.varint(4, 0xFFFF_FFFF)
+
+        let ccmNonce = keys.encryptionNonce + Data(count: 8)
+        var confirm = PBWriter()
+        confirm.bytes(1, MiCrypto.hmacSHA256(key: keys.encryptionKey, phoneNonce + watchNonce))
+        confirm.bytes(2, MiCrypto.ccmEncrypt(key: keys.encryptionKey, nonce: ccmNonce, plaintext: companion.data))
+        var account = PBWriter()
+        account.message(32, confirm)
+        var command = PBWriter()
+        command.varint(1, commandTypeAuth)
+        command.varint(2, subtypeAuth)
+        command.message(3, account)
+        return (command.data, keys)
+    }
+
+    /// Command{type 2 (System), subtype 1}: battery request.
+    static func batteryCommand() -> Data {
+        var command = PBWriter()
+        command.varint(1, 2)
+        command.varint(2, 1)
+        return command.data
+    }
+
+    /// Command.system(4).power(2).battery(1).level(1)
+    static func batteryLevel(_ command: PBMessage) -> UInt64? {
+        command.message(4)?.message(2)?.message(1)?.varints[1]
+    }
+
+    /// Whether the band is on its charger, from the same reply: battery(1).state(2), 1 charging,
+    /// 2 or 3 not. Nil when the reply has no state.
+    static func batteryCharging(_ command: PBMessage) -> Bool? {
+        command.message(4)?.message(2)?.message(1)?.varints[2].map { $0 == 1 }
+    }
+}
+
+extension MiAuth {
+    struct LiveStats: Equatable {
+        let steps: UInt64
+        let calories: UInt64
+        let heartRate: UInt64
+        let standingHours: UInt64
+    }
+
+    /// Command{type 8 (Health), subtype 45 start | 46 stop}: the band then sends subtype 47
+    /// events with today's totals and the current heart rate.
+    static func realtimeCommand(start: Bool) -> Data {
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, start ? 45 : 46)
+        return command.data
+    }
+
+    /// Command.health(10).realTimeStats(39){steps 1, calories 2, heartRate 4, standingHours 6}
+    /// Fields 3 (`distance`) and 5 (`intensity` in AstroBox's BasicData) are not read; 5 is not
+    /// the band's Moving minutes (it read 7 while the band showed 49, docs/CAPABILITIES.md 9.7).
+    static func liveStats(_ command: PBMessage) -> LiveStats? {
+        guard let stats = command.message(10)?.message(39) else { return nil }
+        return LiveStats(steps: stats.varints[1] ?? 0, calories: stats.varints[2] ?? 0,
+                         heartRate: stats.varints[4] ?? 0, standingHours: stats.varints[6] ?? 0)
+    }
+}
+
+extension MiAuth {
+    /// Command{7, 0}: a notification shown on the band.
+    /// notification(9).notification2(3).notification3(1){package 1, appName 2, title 3,
+    /// unknown4 4 (""), body 5, timestamp 6 "yyyyMMdd'T'HHmmss" (local), id 7}
+    static func notificationCommand(id: UInt32, appName: String, title: String, body: String, date: Date = Date()) -> Data {
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.dateFormat = "yyyyMMdd'T'HHmmss"
+        var n3 = PBWriter()
+        n3.string(1, "dev.cobanov.freeband")
+        n3.string(2, appName)
+        n3.string(3, title)
+        n3.string(4, "")
+        n3.string(5, body)
+        n3.string(6, format.string(from: date))
+        n3.varint(7, UInt64(id))
+        var n2 = PBWriter()
+        n2.message(1, n3)
+        var notification = PBWriter()
+        notification.message(3, n2)
+        var command = PBWriter()
+        command.varint(1, 7)
+        command.varint(2, 0)
+        command.message(9, notification)
+        return command.data
+    }
+
+    /// Command{2, 18, system(4).findDevice(5)}: 0 starts vibrating, 1 stops.
+    static func findBandCommand(start: Bool) -> Data {
+        var system = PBWriter()
+        system.varint(5, start ? 0 : 1)
+        var command = PBWriter()
+        command.varint(1, 2)
+        command.varint(2, 18)
+        command.message(4, system)
+        return command.data
+    }
+
+    /// Command{2, 17, system(4).findDevice(5) = 1}: the phone stopped ringing on its own
+    /// (docs/STAY-CONNECTED.md section 1).
+    static func findPhoneStopCommand() -> Data {
+        var system = PBWriter()
+        system.varint(5, 1)
+        var command = PBWriter()
+        command.varint(1, 2)
+        command.varint(2, 17)
+        command.message(4, system)
+        return command.data
+    }
+
+    /// The band's Find Phone (Command{2, 17}): true to start ringing (findDevice 0 or missing),
+    /// false to stop (any other value), nil without a system field.
+    static func findPhoneRequest(_ command: PBMessage) -> Bool? {
+        guard command.varints[1] == 2, command.varints[2] == 17, let system = command.message(4) else { return nil }
+        return (system.varints[5] ?? 0) == 0
+    }
+}
+
+extension MiAuth {
+    /// Command{8,1, health(10).activitySyncRequestToday(5){unknown1: 0}}, or Command{8,2} for past files.
+    static func activityListCommand(today: Bool) -> Data {
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, today ? 1 : 2)
+        if today {
+            var request = PBWriter()
+            request.varint(1, 0)
+            var health = PBWriter()
+            health.message(5, request)
+            command.message(10, health)
+        }
+        return command.data
+    }
+
+    /// Command{8,3, health(10).activityRequestFileIds(2) = 7-byte id}: the file arrives on channel 5.
+    static func activityFetchCommand(_ id: Data) -> Data {
+        var health = PBWriter()
+        health.bytes(2, id)
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, 3)
+        command.message(10, health)
+        return command.data
+    }
+
+    /// Command{8,5}: health(10).activitySyncAckFileIds(3) = the file's id. The band deletes the
+    /// file (docs/ACTIVITY.md section 2.2), so this goes out only for a file that is stored and parsed.
+    static func activityAckCommand(_ id: Data) -> Data {
+        var health = PBWriter()
+        health.bytes(3, id)
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, 5)
+        command.message(10, health)
+        return command.data
+    }
+
+    /// The N×7-byte id list in a {8,1} or {8,2} reply (health(10).activityRequestFileIds(2)).
+    static func activityFileIDBytes(_ command: PBMessage) -> Data {
+        command.message(10)?.blobs[2] ?? Data()
+    }
+}
+
+/// One sleep (a night or a nap) of a SleepResult, in plain values (docs/SLEEP-WRITEBACK.md).
+struct SleepResultSection: Equatable, Sendable {
+    /// Fields 1-5 of ExtraData, raw. Mi Fitness 9.8.348i never sends ExtraData, so the units
+    /// are not known; all five go out when this is set.
+    struct Extra: Equatable, Sendable {
+        var bedtime: Int
+        var sleepTime: Int
+        var quality: Int
+        var efficiency: Int
+        var breathing: Int
+    }
+
+    /// Fell asleep and woke up; sent as Unix seconds.
+    var bedTime: Date
+    var wakeTime: Date
+    /// Offset from UTC in 15-minute blocks, DST included: the tz byte of the sleep file's id.
+    var tzQuarterHours: Int
+    /// Sent in seconds (× 60).
+    var minutesAsleep: Int
+    /// nil goes out as 0, as Mi Fitness does.
+    var averageHeartRate: Int?
+    var averageSpO2: Int?
+    /// nil leaves ExtraData out, as Mi Fitness does.
+    var extra: Extra?
+}
+
+extension MiAuth {
+    /// Command{8,41}: fitness(10).sleepResult(37){section 1 (repeated){timezone 1{offset 1 sint32},
+    /// validSleepTime 2 (s), sleepTimestamp 3, wakeupTimestamp 4, averageHeartRate 5,
+    /// averageBloodOxygen 6, extraData 7{bedtime 1, sleepTime 2, sleepQuality 3, sleepEfficiency 4,
+    /// breathing 5}}}. The phone's sleep summary for the band to show; sections go out oldest
+    /// first. Not tried on a band yet (docs/SLEEP-WRITEBACK.md, "To check on the band").
+    static func sleepResultCommand(_ sections: [SleepResultSection]) -> Data {
+        func unsigned(_ v: Int) -> UInt64 { UInt64(max(v, 0)) }
+        var result = PBWriter()
+        for s in sections.sorted(by: { $0.bedTime < $1.bedTime }) {
+            var zone = PBWriter()
+            zone.sint(1, Int64(s.tzQuarterHours))
+            var section = PBWriter()
+            section.message(1, zone)
+            section.varint(2, unsigned(s.minutesAsleep) * 60)
+            section.varint(3, unsigned(Int(s.bedTime.timeIntervalSince1970)))
+            section.varint(4, unsigned(Int(s.wakeTime.timeIntervalSince1970)))
+            section.varint(5, unsigned(s.averageHeartRate ?? 0))
+            section.varint(6, unsigned(s.averageSpO2 ?? 0))
+            if let e = s.extra {
+                var extra = PBWriter()
+                for (field, value) in [e.bedtime, e.sleepTime, e.quality, e.efficiency, e.breathing].enumerated() {
+                    extra.varint(field + 1, unsigned(value))
+                }
+                section.message(7, extra)
+            }
+            result.message(1, section)
+        }
+        var fitness = PBWriter()
+        fitness.message(37, result)
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, 41)
+        command.message(10, fitness)
+        return command.data
+    }
+}
+
+extension MiAuth {
+    /// Command{2,3}: system(4).clock(4){date 1{year, month, day}, time 2{hour, minute, second, ms},
+    /// timezone 3{zoneOffset 1 sint32, dstOffset 2 sint32 (15-minute blocks), name 3}, isNot24hour 4}.
+    /// Date and time are local.
+    static func clockCommand(now: Date = Date(), timeZone: TimeZone = .current, is24Hour: Bool) -> Data {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let c = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second, .nanosecond], from: now)
+        var date = PBWriter()
+        date.varint(1, UInt64(c.year ?? 2000))
+        date.varint(2, UInt64(c.month ?? 1))
+        date.varint(3, UInt64(c.day ?? 1))
+        var time = PBWriter()
+        time.varint(1, UInt64(c.hour ?? 0))
+        time.varint(2, UInt64(c.minute ?? 0))
+        time.varint(3, UInt64(c.second ?? 0))
+        time.varint(4, UInt64((c.nanosecond ?? 0) / 1_000_000))
+        let dst = Int64(timeZone.daylightSavingTimeOffset(for: now))
+        let standard = Int64(timeZone.secondsFromGMT(for: now)) - dst
+        var zone = PBWriter()
+        zone.sint(1, standard / 900)
+        zone.sint(2, dst / 900)
+        zone.string(3, timeZone.identifier)
+        var clock = PBWriter()
+        clock.message(1, date)
+        clock.message(2, time)
+        clock.message(3, zone)
+        clock.bool(4, !is24Hour)
+        var system = PBWriter()
+        system.message(4, clock)
+        var command = PBWriter()
+        command.varint(1, 2)
+        command.varint(2, 3)
+        command.message(4, system)
+        return command.data
+    }
+
+    /// Whether the phone shows 24-hour time.
+    static var phoneUses24Hour: Bool {
+        !(DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: .current) ?? "").contains("a")
+    }
+
+    /// The answer to the band's Command{16,3} (it asks for the phone's location at every sync):
+    /// Command{16,2} gnss(18).gps_info(3){timestamp 1 (Unix s), longitude 2, latitude 3,
+    /// altitude 4 (doubles)} (docs/CAPABILITIES.md section 9.7; AstroBox wear_gnss.proto).
+    static func gpsInfoCommand(at time: Date, latitude: Double, longitude: Double, altitude: Double?) -> Data {
+        var info = PBWriter()
+        info.varint(1, UInt64(max(time.timeIntervalSince1970, 0)))
+        info.double(2, longitude)
+        info.double(3, latitude)
+        if let altitude { info.double(4, altitude) }
+        var gnss = PBWriter()
+        gnss.message(3, info)
+        var command = PBWriter()
+        command.varint(1, 16)
+        command.varint(2, 2)
+        command.message(18, gnss)
+        return command.data
+    }
+
+    /// A Health command with no payload: Command{8, subtype}.
+    static func healthGet(_ subtype: UInt64) -> Data {
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, subtype)
+        return command.data
+    }
+
+    static func systemGet(_ subtype: UInt64) -> Data {
+        var command = PBWriter()
+        command.varint(1, 2)
+        command.varint(2, subtype)
+        return command.data
+    }
+
+    struct DeviceInfo: Equatable {
+        let serial: String
+        let firmware: String
+        let model: String
+    }
+
+    /// Reply to Command{2,2}: system(4).deviceInfo(3){serialNumber 1, firmware 2, model 4}.
+    static func deviceInfo(_ command: PBMessage) -> DeviceInfo? {
+        guard let info = command.message(4)?.message(3) else { return nil }
+        func text(_ f: Int) -> String { info.blobs[f].map { String(decoding: $0, as: UTF8.self) } ?? "" }
+        return DeviceInfo(serial: text(1), firmware: text(2), model: text(4))
+    }
+
+    struct DeviceState: Equatable {
+        let charging: Bool
+        let worn: Bool
+        let asleep: Bool
+    }
+
+    /// The band's push Command{2,79}: system(4).deviceState(49){charging 1 (1 yes, 2 no), wearing 2, sleep 3}.
+    /// The reply to Command{2,78} (basicDeviceState 48) is not read: a Band 10 Pro on the wrist,
+    /// off its charger, at 82% answered {1: 1, 2: 0, 3: 0, 4: 0}, which is neither Gadgetbridge's
+    /// {isCharging, batteryLevel, isWorn, isUserAsleep} nor anything else settled yet
+    /// (docs/CAPABILITIES.md section 9.7). Charging comes from the battery reply instead.
+    /// A push names only what changed (a Band 10 Pro sent just {1: 2}), so each part is optional.
+    struct DeviceStateChange: Equatable {
+        var charging: Bool?
+        var worn: Bool?
+        var asleep: Bool?
+    }
+
+    static func deviceStateChange(_ command: PBMessage) -> DeviceStateChange? {
+        guard let pushed = command.message(4)?.message(49) else { return nil }
+        return DeviceStateChange(charging: pushed.varints[1].map { $0 == 1 }, worn: pushed.varints[2].map { $0 == 1 },
+                                 asleep: pushed.varints[3].map { $0 == 1 })
+    }
+}
+
+/// A protobuf message as its fields in wire order. A setting the band returned goes back with
+/// only the known fields changed and every other byte as it came (docs/CAPABILITIES.md §1.1).
+struct PBFields: Equatable {
+    struct Field: Equatable {
+        var number: Int
+        /// 0 varint, 1 fixed64, 2 length-delimited, 5 fixed32.
+        var wire: UInt8
+        var varint: UInt64 = 0
+        /// The payload of wire types 1, 2 and 5.
+        var bytes = Data()
+    }
+
+    private(set) var fields: [Field] = []
+
+    init() {}
+
+    init?(_ data: Data) {
+        let b = [UInt8](data)
+        var i = 0
+        func readVarint() -> UInt64? {
+            var result: UInt64 = 0
+            var shift: UInt64 = 0
+            while i < b.count, shift < 64 {
+                let x = b[i]
+                i += 1
+                result |= UInt64(x & 0x7F) << shift
+                if x & 0x80 == 0 { return result }
+                shift += 7
+            }
+            return nil
+        }
+        func take(_ n: Int) -> Data? {
+            guard n >= 0, b.count - i >= n else { return nil }
+            defer { i += n }
+            return Data(b[i..<(i + n)])
+        }
+        while i < b.count {
+            guard let key = readVarint(), key >> 3 > 0 else { return nil }
+            var field = Field(number: Int(key >> 3), wire: UInt8(key & 7))
+            switch field.wire {
+            case 0:
+                guard let v = readVarint() else { return nil }
+                field.varint = v
+            case 1:
+                guard let d = take(8) else { return nil }
+                field.bytes = d
+            case 2:
+                guard let n = readVarint(), n <= UInt64(b.count - i), let d = take(Int(n)) else { return nil }
+                field.bytes = d
+            case 5:
+                guard let d = take(4) else { return nil }
+                field.bytes = d
+            default:
+                return nil
+            }
+            fields.append(field)
+        }
+    }
+
+    func varint(_ number: Int) -> UInt64? {
+        fields.first { $0.number == number && $0.wire == 0 }?.varint
+    }
+
+    func bytes(_ number: Int) -> Data? {
+        fields.first { $0.number == number && $0.wire == 2 }?.bytes
+    }
+
+    /// Replaces the field where it stands, or adds it at the end.
+    mutating func set(_ number: Int, varint value: UInt64) {
+        put(Field(number: number, wire: 0, varint: value))
+    }
+
+    mutating func set(_ number: Int, bytes value: Data) {
+        put(Field(number: number, wire: 2, bytes: value))
+    }
+
+    mutating func remove(_ number: Int) {
+        fields.removeAll { $0.number == number }
+    }
+
+    private mutating func put(_ field: Field) {
+        if let at = fields.firstIndex(where: { $0.number == field.number }) {
+            fields[at] = field
+        } else {
+            fields.append(field)
+        }
+    }
+
+    var data: Data {
+        var out = Data()
+        func putVarint(_ value: UInt64) {
+            var v = value
+            while v >= 0x80 {
+                out.append(UInt8(v & 0x7F) | 0x80)
+                v >>= 7
+            }
+            out.append(UInt8(v))
+        }
+        for field in fields {
+            putVarint(UInt64(field.number) << 3 | UInt64(field.wire))
+            switch field.wire {
+            case 0: putVarint(field.varint)
+            case 2:
+                putVarint(UInt64(field.bytes.count))
+                out.append(field.bytes)
+            default: out.append(field.bytes)
+            }
+        }
+        return out
+    }
+}
+
+/// Health monitoring settings (docs/CAPABILITIES.md §9.1-9.3): Command{8, GET} returns
+/// health(10).<setting>; Command{8, GET + 1} writes the same message back.
+enum MiMonitoring {
+    /// The raw value is the GET subtype.
+    enum Setting: UInt64, CaseIterable {
+        case spo2 = 8, heartRate = 10, stress = 14
+
+        /// The setting's field in `health(10)`.
+        var field: Int {
+            switch self {
+            case .spo2: 7
+            case .heartRate: 8
+            case .stress: 10
+            }
+        }
+    }
+
+    static func get(_ setting: Setting) -> Data {
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, setting.rawValue)
+        return command.data
+    }
+
+    /// The setting's message in the band's reply to a GET, as it came.
+    static func reply(_ command: PBMessage, _ setting: Setting) -> Data? {
+        command.message(10)?.blobs[setting.field]
+    }
+
+    static func set(_ setting: Setting, _ body: Data) -> Data {
+        var health = PBWriter()
+        health.bytes(setting.field, body)
+        var command = PBWriter()
+        command.varint(1, 8)
+        command.varint(2, setting.rawValue + 1)
+        command.message(10, health)
+        return command.data
+    }
+
+    // MARK: heart rate: {disabled 1, interval 2 (minutes; 0 smart), ..., advancedMonitoring 5, unknown7 7, ...}
+
+    enum HeartRateMode: Hashable {
+        case off, smart
+        case every(Int)
+    }
+
+    static func heartRateMode(_ body: Data) -> HeartRateMode? {
+        guard let f = PBFields(body) else { return nil }
+        if f.varint(1) == 1 { return .off }
+        let interval = Int(f.varint(2) ?? 0)
+        return interval == 0 ? .smart : .every(interval)
+    }
+
+    /// Sleep heart rate monitoring ("advanced monitoring"): advancedMonitoring 5{enabled 1}.
+    static func sleepHeartRate(_ body: Data) -> Bool? {
+        PBFields(body)?.bytes(5).flatMap(PBFields.init)?.varint(1).map { $0 == 1 }
+    }
+
+    static func heartRate(_ body: Data, mode: HeartRateMode? = nil, sleep: Bool? = nil) -> Data? {
+        guard var f = PBFields(body) else { return nil }
+        switch mode {
+        case .off: f.set(1, varint: 1)
+        case .smart:
+            f.set(1, varint: 0)
+            f.set(2, varint: 0)
+        case .every(let minutes):
+            f.set(1, varint: 0)
+            f.set(2, varint: UInt64(minutes))
+        case nil: break
+        }
+        // advancedMonitoring is required in a SET, and Gadgetbridge always writes unknown7 = 1.
+        var advanced = f.bytes(5).flatMap(PBFields.init) ?? PBFields()
+        if let sleep { advanced.set(1, varint: sleep ? 1 : 0) } else if advanced.varint(1) == nil { advanced.set(1, varint: 0) }
+        f.set(5, bytes: advanced.data)
+        if f.varint(7) == nil { f.set(7, varint: 1) }
+        // breathingScore 9, irregularRhythmAlert 10, sleepRespiratoryRate 11: 0 means the band
+        // doesn't have it, and such a field must not be sent back.
+        for number in 9...11 where f.varint(number) == 0 { f.remove(number) }
+        return f.data
+    }
+
+    // MARK: SpO2: {unknown1 1 = 1, mode 2 (0 off, 1 during sleep, 2 all day), alarmLow 4}
+
+    static func spo2Mode(_ body: Data) -> Int? {
+        PBFields(body).map { Int($0.varint(2) ?? 0) }
+    }
+
+    static func spo2(_ body: Data, mode: Int) -> Data? {
+        guard var f = PBFields(body) else { return nil }
+        if f.varint(1) == nil { f.set(1, varint: 1) }
+        f.set(2, varint: UInt64(mode))
+        return f.data
+    }
+
+    // MARK: stress: {allDayTracking 1, relaxReminder 2}
+
+    static func stressAllDay(_ body: Data) -> Bool? {
+        PBFields(body).map { $0.varint(1) == 1 }
+    }
+
+    static func stress(_ body: Data, allDay: Bool) -> Data? {
+        guard var f = PBFields(body) else { return nil }
+        f.set(1, varint: allDay ? 1 : 0)
+        return f.data
+    }
+}

@@ -1,0 +1,9 @@
+.gradle/
+build/
+local.properties
+*.jks
+*.keystore
+.idea/
+
+# A fixed test key (public password "android") so each test build installs over the last.
+!debug.keystore

@@ -1,0 +1,11 @@
+.env
+.env.*
+.venv/
+vendor/
+out/
+__pycache__/
+xcuserdata/
+*.xcuserstate
+site/api/runtime-config.php
+site/storage/*.json
+site/Aravia-Beta.apk

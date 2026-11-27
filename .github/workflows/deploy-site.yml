@@ -1,0 +1,148 @@
+name: Publish Builds (Hostinger)
+
+# Uploads ONLY the latest Aravia-Beta.apk and Aravia-Beta.ipa (and stamps their
+# build numbers into remote config.js / index.html) without touching or deleting
+# any other website files hosted on aravia.app. Website source lives privately in
+# marcusaguiarmaciel-cmd/aravia-site.
+on:
+  workflow_run:
+    workflows: ["Build APK", "Build IPA"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-builds-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check Hostinger FTP secrets
+        id: check
+        env:
+          FTP_SERVER: ${{ secrets.HOSTINGER_FTP_SERVER }}
+          FTP_USER: ${{ secrets.HOSTINGER_FTP_USERNAME }}
+          FTP_PASS: ${{ secrets.HOSTINGER_FTP_PASSWORD }}
+        run: |
+          if [ -n "$FTP_SERVER" ] && [ -n "$FTP_USER" ] && [ -n "$FTP_PASS" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Hostinger FTP secrets not configured — skipping upload."
+          fi
+
+      - name: Fetch latest signed Android APK artifact
+        id: fetch_apk
+        if: steps.check.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/builds
+          ART_INFO=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=30" \
+            --jq '[.artifacts[] | select(.expired == false and (.name | test("^Aravia-Android-[0-9]+$")))] | sort_by(.id) | last | "\(.id) \(.name)"')
+          ART_ID=$(echo "$ART_INFO" | awk '{print $1}')
+          ART_NAME=$(echo "$ART_INFO" | awk '{print $2}')
+          if [ -n "$ART_ID" ] && [ "$ART_ID" != "null" ]; then
+            echo "Downloading latest signed APK artifact: $ART_NAME (id $ART_ID)"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ART_ID}/zip" > /tmp/aravia-apk.zip
+            unzip -o /tmp/aravia-apk.zip -d /tmp/aravia-apk
+            APK_FILE=$(find /tmp/aravia-apk -maxdepth 2 -name "*.apk" | head -n 1)
+            if [ -n "$APK_FILE" ]; then
+              cp "$APK_FILE" /tmp/builds/Aravia-Beta.apk
+              ls -lh /tmp/builds/Aravia-Beta.apk
+              APK_NUM=$(echo "$ART_NAME" | sed -E 's/^Aravia-Android-([0-9]+)$/\1/')
+              echo "build=$APK_NUM" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Fetch latest iOS IPA artifact
+        id: fetch_ipa
+        if: steps.check.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/builds
+          ART_INFO=$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=30" \
+            --jq '[.artifacts[] | select(.expired == false and (.name | test("^Aravia-[0-9]+$")))] | sort_by(.id) | last | "\(.id) \(.name)"')
+          ART_ID=$(echo "$ART_INFO" | awk '{print $1}')
+          ART_NAME=$(echo "$ART_INFO" | awk '{print $2}')
+          if [ -n "$ART_ID" ] && [ "$ART_ID" != "null" ]; then
+            echo "Downloading latest iOS IPA artifact: $ART_NAME (id $ART_ID)"
+            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ART_ID}/zip" > /tmp/aravia-ipa.zip
+            unzip -o /tmp/aravia-ipa.zip -d /tmp/aravia-ipa
+            IPA_FILE=$(find /tmp/aravia-ipa -maxdepth 2 -name "*.ipa" | head -n 1)
+            if [ -n "$IPA_FILE" ]; then
+              cp "$IPA_FILE" /tmp/builds/Aravia-Beta.ipa
+              ls -lh /tmp/builds/Aravia-Beta.ipa
+              IPA_NUM=$(echo "$ART_NAME" | sed -E 's/^Aravia-([0-9]+)$/\1/')
+              echo "build=$IPA_NUM" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Upload APK/IPA and stamp remote config.js & index.html via FTPS
+        if: steps.check.outputs.ready == 'true'
+        env:
+          FTP_SERVER: ${{ secrets.HOSTINGER_FTP_SERVER }}
+          FTP_USER: ${{ secrets.HOSTINGER_FTP_USERNAME }}
+          FTP_PASS: ${{ secrets.HOSTINGER_FTP_PASSWORD }}
+          FTP_DIR: ${{ secrets.HOSTINGER_FTP_DIR || '' }}
+          APK_BUILD: ${{ steps.fetch_apk.outputs.build }}
+          IPA_BUILD: ${{ steps.fetch_ipa.outputs.build }}
+        run: |
+          set -euo pipefail
+          CLEAN_DIR=$(echo "$FTP_DIR" | sed -E 's|^\./||; s|^/||; s|/$||')
+          if [ -n "$CLEAN_DIR" ]; then
+            BASE_URL="ftp://${FTP_SERVER}/${CLEAN_DIR}"
+          else
+            BASE_URL="ftp://${FTP_SERVER}"
+          fi
+
+          if [ -f /tmp/builds/Aravia-Beta.apk ]; then
+            echo "Uploading Aravia-Beta.apk (build ${APK_BUILD:-?})..."
+            curl -sS --fail --ftp-ssl -k -u "${FTP_USER}:${FTP_PASS}" \
+              -T /tmp/builds/Aravia-Beta.apk "${BASE_URL}/Aravia-Beta.apk"
+          fi
+
+          if [ -f /tmp/builds/Aravia-Beta.ipa ]; then
+            echo "Uploading Aravia-Beta.ipa (build ${IPA_BUILD:-?})..."
+            curl -sS --fail --ftp-ssl -k -u "${FTP_USER}:${FTP_PASS}" \
+              -T /tmp/builds/Aravia-Beta.ipa "${BASE_URL}/Aravia-Beta.ipa"
+          fi
+
+          # Fetch existing remote config.js & index.html, stamp new build numbers, and upload back.
+          if curl -sS --fail --ftp-ssl -k -u "${FTP_USER}:${FTP_PASS}" "${BASE_URL}/config.js" -o /tmp/builds/config.js && \
+             curl -sS --fail --ftp-ssl -k -u "${FTP_USER}:${FTP_PASS}" "${BASE_URL}/index.html" -o /tmp/builds/index.html; then
+            php -r '
+              $apk = getenv("APK_BUILD");
+              $ipa = getenv("IPA_BUILD");
+              $cfg = file_get_contents("/tmp/builds/config.js");
+              if (strlen($cfg) < 100 || strpos($cfg, "ARAVIA_CONFIG") === false) { exit(1); }
+              if ($apk !== false && ctype_digit($apk)) {
+                $cfg = preg_replace("/versao:\s*\"[^\"]+\"/", "versao: \"1.0-beta." . $apk . "\"", $cfg);
+                $cfg = preg_replace("/apkBuild:\s*\d+/", "apkBuild: " . $apk, $cfg);
+                $cfg = preg_replace("/Aravia-Beta\.apk\?v=\d+/", "Aravia-Beta.apk?v=" . $apk, $cfg);
+              }
+              if ($ipa !== false && ctype_digit($ipa)) {
+                $cfg = preg_replace("/ipaBuild:\s*\d+/", "ipaBuild: " . $ipa, $cfg);
+                $cfg = preg_replace("/Aravia-Beta\.ipa\?v=\d+/", "Aravia-Beta.ipa?v=" . $ipa, $cfg);
+              }
+              file_put_contents("/tmp/builds/config.js", $cfg);
+
+              $html = file_get_contents("/tmp/builds/index.html");
+              if (strlen($html) < 500 || strpos($html, "config.js") === false) { exit(1); }
+              $tag = ($apk ?: "0") . "-" . ($ipa ?: "0");
+              $html = preg_replace("/config\.js\?v=[^\"]+/", "config.js?v=" . $tag, $html);
+              file_put_contents("/tmp/builds/index.html", $html);
+              echo "Stamped remote config.js & index.html (APK=" . ($apk ?: "-") . ", IPA=" . ($ipa ?: "-") . ")\n";
+            '
+            curl -sS --fail --ftp-ssl -k -u "${FTP_USER}:${FTP_PASS}" \
+              -T /tmp/builds/config.js "${BASE_URL}/config.js"
+            curl -sS --fail --ftp-ssl -k -u "${FTP_USER}:${FTP_PASS}" \
+              -T /tmp/builds/index.html "${BASE_URL}/index.html"
+          else
+            echo "::warning::Could not fetch remote config.js/index.html for version stamping; binary upload still succeeded."
+          fi

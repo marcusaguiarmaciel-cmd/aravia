@@ -1,0 +1,129 @@
+name: Build APK
+
+# Triggered manually (workflow_dispatch) or on release tags (v*, android-v*) to save
+# private-repo GitHub Actions minutes. The emulator screenshots job is opt-in.
+on:
+  workflow_dispatch:
+    inputs:
+      run_screens:
+        description: "Rodar emulador Android para gerar screenshots (consome ~5 min extras)"
+        type: boolean
+        default: false
+  push:
+    tags: ["v*", "android-v*"]
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: GPS fixtures match their Python source
+        run: |
+          python3 -I android/protocol/tools/make_gps_fixtures.py
+          git diff --exit-code android/protocol/src/test/resources
+      - name: Protocol tests
+        working-directory: android
+        run: gradle --no-daemon :protocol:test
+      - name: Check the protocol against the iOS vectors
+        run: |
+          pip install --quiet cryptography
+          python3 ios/tests/protocol/check_vectors.py --subset < android/protocol/build/vectors.json
+      - name: Prepare release keystore (optional)
+        env:
+          ARAVIA_KEYSTORE_BASE64: ${{ secrets.ARAVIA_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ARAVIA_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ARAVIA_KEYSTORE_BASE64" | base64 -d > /tmp/aravia-release.jks
+            echo "ARAVIA_KEYSTORE=/tmp/aravia-release.jks" >> "$GITHUB_ENV"
+          fi
+      - name: Build
+        working-directory: android
+        env:
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          ADMOB_APP_ID: ${{ secrets.ADMOB_APP_ID }}
+          ADMOB_REWARDED_UNIT_ID: ${{ secrets.ADMOB_REWARDED_UNIT_ID }}
+          ARAVIA_KEYSTORE_PASSWORD: ${{ secrets.ARAVIA_KEYSTORE_PASSWORD }}
+          ARAVIA_KEY_ALIAS: ${{ secrets.ARAVIA_KEY_ALIAS }}
+          ARAVIA_KEY_PASSWORD: ${{ secrets.ARAVIA_KEY_PASSWORD }}
+          LEGAL_CONTROLLER_DOC: ${{ secrets.LEGAL_CONTROLLER_DOC }}
+          RUN_SCREENS: ${{ inputs.run_screens == true }}
+        run: |
+          if [ "$RUN_SCREENS" = "true" ]; then
+            gradle --no-daemon assembleRelease assembleDebug
+          else
+            gradle --no-daemon assembleRelease
+          fi
+      - name: Name the APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk "Aravia-${{ github.run_number }}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Aravia-Android-${{ github.run_number }}
+          path: Aravia-${{ github.run_number }}.apk
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.run_screens == true }}
+        with:
+          name: android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 3
+
+  # The app on an emulator: opt-in via workflow_dispatch (run_screens=true) to save CI minutes.
+  screens:
+    needs: build
+    if: ${{ inputs.run_screens == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-debug-apk
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Screens on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          script: sh android/tools/screens.sh app-debug.apk screens
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Aravia-Android-screens-${{ github.run_number }}
+          path: screens
+          retention-days: 7
+      # Also on the ci-screens branch (made-up demo data only), where they can be read with git.
+      - name: Publish the screens to the ci-screens branch
+        if: always()
+        run: |
+          [ -d screens ] || exit 0
+          cd screens
+          git init -q -b ci-screens
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -qm "Screens of run ${{ github.run_number }} (${{ github.sha }})"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" ci-screens

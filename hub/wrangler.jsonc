@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openband-hub",
+  "main": "src/index.ts",
+  // Matches the workerd runtime shipped with the pinned wrangler 4.143.0.
+  // Raise it together with wrangler and re-run the tests.
+  "compatibility_date": "2026-09-26",
+
+  // Serve only on the custom domain: no *.workers.dev URL, no preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "freeband.cobanov.dev", "custom_domain": true }],
+
+  // Self-hosted Open Sauce Sans font files (SIL OFL), the favicon and images.
+  "assets": { "directory": "./public" },
+
+  "vars": {
+    // Hostname the site is served on; Open Graph and hreflang URLs are built from it.
+    "PUBLIC_HOSTNAME": "freeband.cobanov.dev",
+    // Public TestFlight link shown on the home page and /guide; empty hides it.
+    "TESTFLIGHT_URL": "https://testflight.apple.com/join/Qq9A6c1E"
+  },
+
+  // Explicitly empty: the Worker has no scheduled handler any more, and leaving
+  // "triggers" out would keep the old daily cron on the deployed Worker.
+  "triggers": { "crons": [] },
+
+  "dev": { "port": 8787, "local_protocol": "http" },
+
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.05 }
+  }
+}

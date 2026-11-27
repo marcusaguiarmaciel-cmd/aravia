@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Route videos handed to other apps (share sheet) from the app's cache. -->
+<paths>
+    <cache-path name="videos" path="videos/" />
+    <cache-path name="raw" path="raw/" />
+</paths>

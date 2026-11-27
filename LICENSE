@@ -1,0 +1,58 @@
+ARAVIA — LICENÇA PROPRIETÁRIA (TODOS OS DIREITOS RESERVADOS)
+ARAVIA — PROPRIETARY LICENSE (ALL RIGHTS RESERVED)
+
+Copyright (c) 2026 Marcus Aguiar Maciel. Todos os direitos reservados / All rights reserved.
+
+-------------------------------------------------------------------------------
+PORTUGUÊS
+-------------------------------------------------------------------------------
+
+Este repositório é disponibilizado publicamente exclusivamente para fins de
+compilação (CI/CD) e inspeção visual. Nenhuma licença de código aberto é
+concedida sobre o código-fonte, design, marca, ilustrações (incluindo a Arara),
+textos, ativos visuais ou funcionalidades originais do Aravia.
+
+É EXPRESSAMENTE PROIBIDO, sem autorização prévia e por escrito do titular
+(contato@aravia.app):
+
+1. Copiar, reproduzir, clonar para uso próprio ou reutilizar qualquer parte
+   deste código-fonte, estrutura, interface, lógica ou ativos;
+2. Modificar, adaptar, traduzir, criar obras derivadas ou incorporar qualquer
+   trecho deste repositório em outro software, aplicativo ou serviço;
+3. Redistribuir, republicar, vender, alugar, sublicenciar, hospedar ou
+   disponibilizar versões compiladas ou não compiladas (comercialmente ou não);
+4. Utilizar a marca "Aravia", identidade visual, ilustrações ou nome do projeto.
+
+O descumprimento desta licença constitui violação de direitos autorais nos
+termos da Lei nº 9.610/1998 (Brasil), Lei nº 9.609/1998 (Lei do Software) e
+tratados internacionais aplicáveis.
+
+Avisos de terceiros: componentes originalmente derivados do projeto Freeband
+(licença MIT) mantêm seu aviso de direitos autorais original em
+THIRD-PARTY-NOTICES.md, aplicando-se exclusivamente aos trechos originais
+daquele projeto e não às criações, modificações e extensões proprietárias do
+Aravia.
+
+-------------------------------------------------------------------------------
+ENGLISH
+-------------------------------------------------------------------------------
+
+This repository is made publicly visible strictly for CI/CD build purposes and
+read-only inspection. No open-source license is granted over Aravia's original
+source code, design, brand, artwork (including the Arara mascot), copy, visual
+assets, or proprietary features.
+
+WITHOUT PRIOR WRITTEN PERMISSION FROM THE COPYRIGHT HOLDER (contato@aravia.app),
+YOU MAY NOT:
+
+1. Copy, reproduce, reuse, or extract any part of this source code, UI, logic,
+   or assets for any personal, academic, or commercial purpose;
+2. Modify, adapt, alter, or create derivative works based on this repository;
+3. Redistribute, republish, sell, sublicense, host, or distribute compiled or
+   uncompiled copies;
+4. Use the "Aravia" name, branding, visual identity, or artwork.
+
+Third-party notices: portions originally based on Freeband (MIT License) retain
+their original copyright and permission notice in THIRD-PARTY-NOTICES.md; all
+Aravia additions, modifications, designs, and original modules remain strictly
+All Rights Reserved.

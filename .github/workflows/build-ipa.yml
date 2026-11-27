@@ -1,0 +1,65 @@
+name: Build IPA
+
+# Builds an unsigned .ipa on a GitHub-hosted Mac. Install it with Sideloadly (Windows),
+# which signs it with your own Apple ID.
+# Triggered manually (workflow_dispatch) or on release tags (v*, ios-v*) so macOS runner
+# minutes (10x quota multiplier on private repos) are only spent when cutting a build.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*", "ios-v*"]
+
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # build-ipa.sh numbers the build by commit count
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+
+      - name: Run Swift analytics tests
+        working-directory: ios/tests/analytics
+        run: |
+          swiftc ../../Freeband/Analytics/*.swift main.swift -o /tmp/an
+          /tmp/an
+
+      - name: Build unsigned IPA
+        working-directory: ios
+        env:
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
+          ADMOB_IOS_APP_ID: ${{ secrets.ADMOB_IOS_APP_ID }}
+          ADMOB_IOS_REWARDED_UNIT_ID: ${{ secrets.ADMOB_IOS_REWARDED_UNIT_ID }}
+          LEGAL_CONTROLLER_DOC: ${{ secrets.LEGAL_CONTROLLER_DOC }}
+        run: |
+          [ -n "$STRAVA_CLIENT_ID" ] && [ -n "$STRAVA_CLIENT_SECRET" ] && echo "Strava keys: present" || echo "::warning::STRAVA_CLIENT_ID or STRAVA_CLIENT_SECRET is missing; this build has no Strava upload"
+          sh tools/build-ipa.sh
+
+      - name: Check keys went in
+        run: |
+          plist=ios/build/DerivedData/Build/Products/Release-iphoneos/Freeband.app/Info.plist
+          id=$(/usr/libexec/PlistBuddy -c "Print :StravaClientID" "$plist" 2>/dev/null || true)
+          case "$id" in ''|*'$('*) echo "::warning::no Strava client ID in the app" ;; *) echo "Strava client ID: ${#id} digits" ;; esac
+          admob=$(/usr/libexec/PlistBuddy -c "Print :GADApplicationIdentifier" "$plist" 2>/dev/null || true)
+          echo "AdMob App ID: $admob"
+
+      - name: Rename
+        run: |
+          mv ios/build/Freeband.ipa "ios/build/Aravia-${{ github.run_number }}.ipa"
+          ls -lh "ios/build/Aravia-${{ github.run_number }}.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Aravia-${{ github.run_number }}
+          path: ios/build/Aravia-*.ipa
+          retention-days: 30
